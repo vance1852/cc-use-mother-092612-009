@@ -9,12 +9,26 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .errors import DomainError, ValidationError
+from .followup_service import FollowupService
 from .service import DomainService
 from .storage import Database
 
 
+def _explanation(payload) -> dict[str, Any]:
+    return {
+        "summary_ref": payload.summary_ref,
+        "participant_ref": payload.participant_ref,
+        "tier": payload.tier,
+        "category": payload.category,
+        "decisions": payload.decisions,
+        "messages": payload.messages,
+        "handoff": payload.handoff,
+    }
+
+
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
-          headers: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+          headers: dict[str, str] | None = None,
+          followup_service: FollowupService | None = None) -> tuple[int, dict[str, Any]]:
     """把一个 HTTP 语义请求分派到领域服务。"""
 
     headers = headers or {}
@@ -48,6 +62,10 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if followup_service is not None:
+            status, payload = _followup_route(followup_service, method, parsed, body, actor_id)
+            if status is not None:
+                return status, payload
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
@@ -55,10 +73,56 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
         return 400, {"error": "invalid_request", "message": str(exc)}
 
 
+def _followup_route(followup: FollowupService, method: str, parsed, body: dict[str, Any],
+                    actor_id: str) -> tuple[int | None, dict[str, Any]]:
+    """分派诊后联系分流相关接口。"""
+
+    path = parsed.path
+    query = parse_qs(parsed.query)
+    if method == "POST" and path == "/followup-categories":
+        result = followup.register_category(actor_id=actor_id, **body)
+        return (200 if result["replayed"] else 201), result
+    if method == "POST" and path == "/message-templates":
+        result = followup.publish_template(actor_id=actor_id, **body)
+        return (200 if result["replayed"] else 201), result
+    if method == "POST" and path == "/message-templates/recall":
+        result = followup.recall_template(actor_id=actor_id, **body)
+        return 200, result
+    if method == "POST" and path == "/consents":
+        result = followup.record_consent(actor_id=actor_id, **body)
+        return (200 if result["replayed"] else 201), result
+    if method == "POST" and path == "/followups":
+        result = followup.record_followup(actor_id=actor_id, **body)
+        return (200 if result["replayed"] else 201), result
+    if method == "POST" and path == "/followups/dispatch-due":
+        return 200, followup.dispatch_due(actor_id=actor_id or "system-dispatcher")
+    if method == "POST" and path == "/followups/expire-overdue":
+        return 200, {"expired": followup.expire_overdue(actor_id=actor_id or "system-scheduler")}
+    if method == "POST" and path == "/handoffs/escalate-due":
+        return 200, followup.escalate_due(actor_id=actor_id or "system-scheduler")
+    if method == "POST" and path == "/handoffs/acknowledge":
+        result = followup.acknowledge_handoff(actor_id=actor_id, **body)
+        return 200, result
+    if method == "POST" and path == "/followups/takeover":
+        result = followup.takeover(actor_id=actor_id, **body)
+        return 200, result
+    if method == "POST" and path == "/receipts/confirm":
+        receipt = followup.confirm_delivery(**body)
+        return 200, receipt.__dict__
+    if method == "GET" and path == "/followups/pending":
+        return 200, followup.list_pending()
+    if method == "GET" and path.startswith("/followups/") and path.endswith("/explain"):
+        summary_ref = path.split("/")[2]
+        explanation = followup.explain(actor_id=actor_id, summary_ref=summary_ref)
+        return 200, _explanation(explanation)
+    return None, {}
+
+
 class Handler(BaseHTTPRequestHandler):
     """把标准库 HTTP 请求转换为路由调用。"""
 
     service: DomainService
+    followup_service: FollowupService
 
     def _handle(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
@@ -69,7 +133,8 @@ class Handler(BaseHTTPRequestHandler):
             self._write(400, {"error": "invalid_json", "message": "请求体必须是 UTF-8 JSON"})
             return
         status, payload = route(self.service, self.command, self.path, body,
-                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")})
+                                {"X-Actor-Id": self.headers.get("X-Actor-Id", "")},
+                                followup_service=self.followup_service)
         self._write(status, payload)
 
     def _write(self, status: int, payload: dict[str, Any]) -> None:
@@ -100,6 +165,8 @@ def main() -> int:
     args = parser.parse_args()
     database = Database(args.database)
     Handler.service = DomainService(database)
+    # 渠道网关由部署环境注入；未注入时发送类接口会返回明确错误而不会静默丢弃
+    Handler.followup_service = FollowupService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
